@@ -24,12 +24,11 @@ class CodebaseIndexer:
 
     def build_index(self, commit_sha: str) -> Dict[str, Any]:
         """Builds and caches code embeddings for a specific commit."""
-        target_file = self._get_index_file(commit_sha)
-        if target_file.exists():
-            return {"status": "ALREADY_INDEXED", "commit_sha": commit_sha}
-
-        # 1. Checkout commit
+        # 1. Ensure repo is cloned/fetched and checkout commit
         resolved_sha = self.git_mgr.checkout_commit(commit_sha)
+        target_file = self._get_index_file(resolved_sha)
+        if target_file.exists():
+            return {"status": "ALREADY_INDEXED", "commit_sha": resolved_sha}
 
         # 2. Extract code chunks
         code_files = self.git_mgr.list_code_files()

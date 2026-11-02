@@ -1,15 +1,48 @@
 import os
+import re
 import subprocess
 import hashlib
+import base64
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from .config import CACHE_DIR
 
 class GitManager:
-    def __init__(self, repo_url: str, cache_dir: Optional[Path] = None):
-        self.repo_url = repo_url.strip()
+    def __init__(self, repo_url: str, cache_dir: Optional[Path] = None, access_token: Optional[str] = None):
+        raw_url = repo_url.strip()
+        self.access_token = access_token or self._extract_token(raw_url) or os.getenv("GITHUB_TOKEN")
+        self.repo_url = self._clean_url(raw_url)
         self.cache_dir = cache_dir or CACHE_DIR
         self.repo_path = self._resolve_repo_path()
+
+    @staticmethod
+    def _clean_url(url: str) -> str:
+        """Strips embedded credentials from URL for deterministic hashing and secure storage."""
+        return re.sub(r'https?://[^@]+@', 'https://', url.strip())
+
+    @staticmethod
+    def _extract_token(url: str) -> Optional[str]:
+        """Extracts token if embedded in URL format like https://x-access-token:<token>@github.com."""
+        match = re.search(r'https?://[^:]+:([^@]+)@github\.com', url)
+        if match:
+            return match.group(1)
+        match = re.search(r'https?://([^@]+)@github\.com', url)
+        if match:
+            return match.group(1)
+        return None
+
+    def get_authenticated_url(self) -> str:
+        """Builds an authenticated clone URL for private repositories."""
+        if self.access_token and "github.com" in self.repo_url and "@" not in self.repo_url:
+            return self.repo_url.replace("https://github.com", f"https://x-access-token:{self.access_token}@github.com")
+        return self.repo_url
+
+    def _get_git_env(self) -> Dict[str, str]:
+        """Non-interactive git environment to prevent hanging on auth prompts."""
+        env = dict(os.environ)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_ASKPASS"] = ""
+        return env
 
     def _resolve_repo_path(self) -> Path:
         """Resolves local repository path or clones remote into cache_dir."""
@@ -18,30 +51,49 @@ class GitManager:
         if candidate_path.is_dir() and (candidate_path / ".git").exists():
             return candidate_path.resolve()
 
-        # 2. Remote URL - create a deterministic folder name
+        # 2. Remote URL - create a deterministic folder name from clean URL
         url_hash = hashlib.sha256(self.repo_url.encode()).hexdigest()[:12]
         safe_name = "".join(c if c.isalnum() else "_" for c in self.repo_url.split("/")[-1].replace(".git", ""))
         repo_dir = self.cache_dir / f"{safe_name}_{url_hash}"
         return repo_dir
 
+    def fetch_latest(self) -> None:
+        """Fetches the latest commits from remote, with auth headers if private."""
+        if not (self.repo_path / ".git").exists():
+            return
+        fetch_cmd = ["git", "fetch", "--all", "--tags"]
+        if self.access_token and "github.com" in self.repo_url:
+            auth_b64 = base64.b64encode(f"x-access-token:{self.access_token}".encode()).decode()
+            fetch_cmd = ["git", "-c", f"http.https://github.com/.extraHeader=AUTHORIZATION: basic {auth_b64}", "fetch", "--all", "--tags"]
+        subprocess.run(
+            fetch_cmd,
+            cwd=str(self.repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self._get_git_env()
+        )
+
     def ensure_repo(self) -> Path:
         """Ensures repository is cloned and up to date."""
         if not self.repo_path.exists():
-            # Clone repo
-            cmd = ["git", "clone", self.repo_url, str(self.repo_path)]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            # Clone repo with authentication if private
+            clone_url = self.get_authenticated_url()
+            cmd = ["git", "clone", clone_url, str(self.repo_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=self._get_git_env())
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to clone repository {self.repo_url}: {result.stderr}")
-        else:
-            # Fetch latest
-            if (self.repo_path / ".git").exists():
+
+            # Reset origin URL to clean URL so credentials are never saved to .git/config on disk
+            if self.access_token:
                 subprocess.run(
-                    ["git", "fetch", "--all"],
+                    ["git", "remote", "set-url", "origin", self.repo_url],
                     cwd=str(self.repo_path),
                     capture_output=True,
-                    text=True,
                     check=False
                 )
+        else:
+            self.fetch_latest()
         return self.repo_path
 
     def checkout_commit(self, commit_sha: str) -> str:
@@ -67,7 +119,17 @@ class GitManager:
             check=False
         )
         if result.returncode != 0:
-            # If commit not found, try fetching or return HEAD
+            # If commit not found, fetch latest and retry checkout
+            self.fetch_latest()
+            retry = subprocess.run(
+                ["git", "checkout", commit_sha],
+                cwd=str(self.repo_path),
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if retry.returncode == 0:
+                return commit_sha
             return self.get_head_commit()
         return commit_sha
 
